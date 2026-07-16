@@ -14,7 +14,9 @@ Comandos:
 import asyncio
 import logging
 from typing import Optional
+import worker
 
+from seedr_client import SeedrApiError
 from telethon import TelegramClient, events
 
 import config
@@ -222,3 +224,103 @@ def register_handlers(client: TelegramClient) -> None:
         await event.respond(
             f"{header}\n\n**Cola actual:**\n" + "\n".join(lines) + extra, parse_mode="markdown"
         )
+
+    @client.on(events.NewMessage(pattern=r"^/seedrls$"))
+    async def seedrls_handler(event):
+        if not _is_admin(event.sender_id):
+            await event.respond("No tienes permiso para usar este comando.")
+            return
+
+        try:
+            seedr_client = await asyncio.to_thread(worker.get_seedr_client)
+        except seedr_auth.SeedrAuthError as e:
+            await event.respond(f"❌ Seedr no está vinculado: {e}")
+            return
+
+        try:
+            root = await asyncio.to_thread(seedr_client.get_folder_contents, 0)
+            tasks_raw = await asyncio.to_thread(seedr_client.list_tasks)
+        except SeedrApiError as e:
+            await event.respond(f"❌ Error consultando Seedr: {e}")
+            return
+
+        folders = root.get("folders", []) if isinstance(root, dict) else []
+        files = root.get("files", []) if isinstance(root, dict) else []
+        tasks = tasks_raw if isinstance(tasks_raw, list) else tasks_raw.get("tasks", [])
+
+        lines = ["📦 **Contenido actual en Seedr**\n"]
+
+        if tasks:
+            lines.append("**Tareas activas (torrents descargando):**")
+            for t in tasks[:20]:
+                tid = t.get("id") or t.get("task_id")
+                name = t.get("name") or t.get("filename") or "(sin nombre)"
+                status = t.get("status", "?")
+                progress = t.get("progress", "?")
+                lines.append(f"  task `{tid}` — {name} [{status} {progress}]")
+            lines.append("")
+
+        if folders:
+            lines.append("**Carpetas en raíz:**")
+            for fo in folders[:20]:
+                lines.append(f"  folder `{fo.get('id')}` — {fo.get('name')}")
+            lines.append("")
+
+        if files:
+            lines.append("**Archivos en raíz (usa el id con /seedrpush):**")
+            for fi in files[:30]:
+                fid = fi.get("id") or fi.get("file_id")
+                lines.append(f"  file `{fid}` — {fi.get('name')} ({fi.get('size', '?')} bytes)")
+
+        if not (tasks or folders or files):
+            lines.append("No hay nada en Seedr ahora mismo.")
+
+        text = "\n".join(lines)
+        # Telegram limita ~4096 caracteres por mensaje.
+        await event.respond(text[:4000], parse_mode="markdown")
+
+    @client.on(events.NewMessage(pattern=r"^/seedrpush(?:\s+(.*))?$"))
+    async def seedrpush_handler(event):
+        if not _is_admin(event.sender_id):
+            await event.respond("No tienes permiso para usar este comando.")
+            return
+
+        raw = event.pattern_match.group(1)
+        if not raw or not raw.strip():
+            await event.respond(
+                "Uso: `/seedrpush <file_id> [file_id...]`\n"
+                "Los IDs de archivo se obtienen con /seedrls.",
+                parse_mode="markdown",
+            )
+            return
+
+        try:
+            file_ids = [int(x) for x in raw.split()]
+        except ValueError:
+            await event.respond("Los IDs deben ser números. Ejemplo: `/seedrpush 12345`", parse_mode="markdown")
+            return
+
+        try:
+            seedr_client = await asyncio.to_thread(worker.get_seedr_client)
+        except seedr_auth.SeedrAuthError as e:
+            await event.respond(f"❌ Seedr no está vinculado: {e}")
+            return
+
+        for file_id in file_ids:
+            await event.respond(f"⏳ Procesando archivo `{file_id}`...", parse_mode="markdown")
+            try:
+                details = await asyncio.to_thread(seedr_client.get_file_details, file_id)
+                file_name = details.get("name") or details.get("file_name") or f"file_{file_id}"
+            except SeedrApiError as e:
+                await event.respond(f"❌ No se pudo obtener info del archivo `{file_id}`: {e}", parse_mode="markdown")
+                continue
+
+            try:
+                await worker.deliver_file(
+                    seedr_client, client, file_id, file_name,
+                    caption=file_name, tag=f"manual{file_id}",
+                )
+                await event.respond(f"✅ `{file_id}` ({file_name}) subido a Telegram y limpiado de Seedr.", parse_mode="markdown")
+            except Exception as e:
+                logger.exception("Error en /seedrpush para file_id=%s", file_id)
+                await event.respond(f"❌ Falló `{file_id}`: {e}", parse_mode="markdown")

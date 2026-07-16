@@ -39,7 +39,7 @@ def _sanitize_filename(name: str, max_len: int = 150) -> str:
     return name[:max_len] if len(name) > max_len else name
 
 
-def _get_seedr_client() -> SeedrClient:
+def get_seedr_client() -> SeedrClient:
     access_token = get_valid_access_token()
     return SeedrClient(access_token=access_token, base_url=config.SEEDR_API_BASE_URL)
 
@@ -82,6 +82,40 @@ async def _wait_for_space(client: SeedrClient, needed_bytes: int, stop_event: as
         except asyncio.TimeoutError:
             pass
 
+async def deliver_file(
+    client: SeedrClient,
+    telegram_client: TelegramClient,
+    file_id,
+    file_name: str,
+    caption: str = "",
+    tag: str = "manual",
+) -> None:
+    """Descarga un archivo puntual de Seedr, lo sube a Telegram y limpia todo
+    (Seedr + disco local). Usado tanto por el flujo normal de la cola como
+    por el comando manual /seedrpush."""
+    dest = config.DOWNLOAD_DIR / f"{tag}_{_sanitize_filename(file_name)}"
+
+    logger.info("Descargando %s (file_id=%s) a %s", file_name, file_id, dest)
+    await asyncio.to_thread(client.download_file_to_path, file_id, dest)
+
+    try:
+        await asyncio.to_thread(client.delete_file, file_id)
+    except SeedrApiError:
+        logger.exception("No se pudo borrar el archivo %s en Seedr (se continúa igual).", file_id)
+
+    logger.info("Subiendo %s a Telegram (%s)", dest.name, config.TELEGRAM_TARGET_CHAT)
+    try:
+        await telegram_client.send_file(
+            config.TELEGRAM_TARGET_CHAT,
+            str(dest),
+            caption=(caption or file_name)[:1024],
+            force_document=True,
+        )
+    finally:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("No se pudo borrar el archivo local %s", dest)
 
 async def _process_item(
     item_id: int,
@@ -102,7 +136,7 @@ async def _process_item(
     logger.info("Procesando item %s: %s", item_id, title)
 
     try:
-        client = await asyncio.to_thread(_get_seedr_client)
+        client = await asyncio.to_thread(get_seedr_client)
 
         # 1) Esperar espacio suficiente.
         await asyncio.to_thread(db.update_item_status, item_id, "waiting_space")
@@ -155,34 +189,10 @@ async def _process_item(
             if file_id is None:
                 raise SeedrApiError(f"No se pudo determinar el id de archivo en la entrada: {f}")
 
-            file_name = _sanitize_filename(f.get("name") or f.get("file_name") or f"file_{file_id}")
-            dest = config.DOWNLOAD_DIR / f"{item_id}_{file_name}"
+            file_name = f.get("name") or f.get("file_name") or f"file_{file_id}"
 
-            logger.info("Descargando %s (file_id=%s) a %s", file_name, file_id, dest)
-            await asyncio.to_thread(client.download_file_to_path, file_id, dest)
-
-            # 6) Borrar el archivo de Seedr ni bien está en local, para liberar espacio.
-            try:
-                await asyncio.to_thread(client.delete_file, file_id)
-            except SeedrApiError:
-                logger.exception("No se pudo borrar el archivo %s en Seedr (se continúa igual).", file_id)
-
-            # 7) Subir a Telegram.
             await asyncio.to_thread(db.update_item_status, item_id, "uploading_telegram")
-            logger.info("Subiendo %s a Telegram (%s)", dest.name, config.TELEGRAM_TARGET_CHAT)
-            try:
-                await telegram_client.send_file(
-                    config.TELEGRAM_TARGET_CHAT,
-                    str(dest),
-                    caption=title[:1024],
-                    force_document=True,
-                )
-            finally:
-                # 8) Borrar archivo local (siempre, haya fallado o no la subida).
-                try:
-                    dest.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("No se pudo borrar el archivo local %s", dest)
+            await deliver_file(client, telegram_client, file_id, file_name, caption=title, tag=str(item_id))
 
         # Limpieza final de la tarea en Seedr (no borra archivos, ya los borramos arriba).
         try:
