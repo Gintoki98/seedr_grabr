@@ -3,3 +3,7 @@ requests>=2.31
 feedparser>=6.0
 python-dotenv>=1.0
 psycopg2-binary>=2.9
+cryptg>=0.6.0
+hachoir>=3.3.0
+pillow>=12.3.0
+aiohttp>=3.14.1
