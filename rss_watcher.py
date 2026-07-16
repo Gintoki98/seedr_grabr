@@ -112,13 +112,11 @@ async def poll_once(upload_queue: "asyncio.Queue") -> int:
         if not matched:
             continue
 
-        # Se usa el <guid> del item (no el <link>) como URL a enviar a Seedr,
-        # tal como indicaste. En nyaa.si el guid es la página de info del
-        # torrent (https://nyaa.si/view/<id>), no un .torrent directo; por
-        # eso el cliente de Seedr (add_torrent_from_page) intenta agregarlo
-        # tal cual y, si la API lo rechaza, cae en /scrape/html/torrents
-        # para resolver el enlace magnet/torrent real desde esa página.
-        torrent_url = guid
+        # Se usa el <link> del item: es la URL directa de descarga del
+        # .torrent (ej. https://nyaa.si/download/2133139.torrent). El bot lo
+        # descarga y lo sube a Seedr como archivo (add_torrent_by_file), en
+        # vez de pasarle una URL para que Seedr la resuelva.
+        torrent_url = entry.get("link", "") or guid
         # nyaa expone el tamaño en el namespace nyaa:size
         size_str = entry.get("nyaa_size") or entry.get("size")
         size_bytes = parse_size_to_bytes(size_str)

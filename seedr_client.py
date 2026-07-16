@@ -29,6 +29,7 @@ Endpoints usados:
 import json
 import logging
 import time
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -205,6 +206,16 @@ class SeedrClient:
         if folder_id not in (0, "0", None):
             data["folder_id"] = folder_id
         return self.request("/tasks", method="POST", data=data)
+
+    def add_torrent_by_file(self, torrent_file_path: Path, folder_id: Union[int, str] = 0) -> Dict[str, Any]:
+        """Sube un archivo .torrent ya descargado en disco (multipart/form-data)."""
+        file_name = os.path.basename(torrent_file_path)
+        data = {}
+        if folder_id not in (0, "0", None):
+            data["folder_id"] = folder_id
+        with open(torrent_file_path, "rb") as f:
+            files = {"file": (file_name, f, "application/x-bittorrent")}
+            return self.request("/tasks", method="POST", files=files, data=data or None)
 
     def add_torrent_from_page(self, page_url: str, folder_id: Union[int, str] = 0) -> Dict[str, Any]:
         """Intenta agregar un torrent directamente a partir de `page_url`

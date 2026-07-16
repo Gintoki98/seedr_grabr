@@ -1,53 +1,40 @@
 """
 Autenticación OAuth 2.0 Device Flow contra la API de Seedr v2.
 
-Este módulo se basa en el ejemplo `seedr_device_flow_auth.py` provisto,
-reorganizado para:
-  1) Poder ejecutarse una sola vez de forma interactiva (ver `authenticate.py`)
-     para vincular la cuenta y guardar el token en disco.
-  2) Ser reutilizado en tiempo de ejecución por el bot para refrescar el
-     access_token automáticamente cuando expira, sin intervención humana.
+El token (access_token + refresh_token) se guarda en PostgreSQL (tabla
+`seedr_token`, ver db.py) en vez de un archivo local — así no hace falta
+subir ningún secreto a GitHub ni configurar un volumen persistente en
+Coolify: mientras la base de datos exista, el token sobrevive a cualquier
+redeploy.
 
-NOTA:
-Según la documentación oficial de la API (API Documentation - Seedr API Console)
-el flujo de device code usa DOS endpoints distintos, algo fácil de pasar por
-alto:
-  - POST /oauth/device/code   -> solicita device_code + user_code
-  - POST /oauth/device/token  -> polling para obtener el access_token
-    (grant_type = 'urn:ietf:params:oauth:grant-type:device_code')
+El flujo se puede disparar desde:
+  - El comando /auth del bot de Telegram (telegram_bot.py) — recomendado.
+  - El script CLI `authenticate.py` (alternativa para setup sin Telegram).
 
-El endpoint POST /oauth/token es un endpoint DISTINTO que se usa para:
-  - Intercambiar un authorization_code (grant_type=authorization_code)
-  - Refrescar un token (grant_type=refresh_token)
-  - Client credentials (grant_type=client_credentials)
-
-Este módulo ya refleja esa separación. El prefijo de path (`API_PATH_PREFIX`)
-sigue sin estar confirmado en la documentación (los ejemplos que diste usan
-`/api/v0.1/p`), así que se mantiene como constante fácil de ajustar si hiciera
-falta.
+Endpoints (según la documentación oficial de la API):
+  POST /oauth/device/code   -> solicita device_code + user_code
+  POST /oauth/device/token  -> polling para obtener el access_token
+  POST /oauth/token         -> refrescar un token (grant_type=refresh_token)
 """
 import json
 import logging
-import sys
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
 
 import config
+import db
 
 logger = logging.getLogger(__name__)
 
-# AJUSTAR si tu base URL no necesita este prefijo (ver nota arriba).
+# AJUSTAR si tu base URL no necesita este prefijo.
 API_PATH_PREFIX = "/api/v0.1/p"
 
 DEVICE_CODE_ENDPOINT = f"{config.SEEDR_API_BASE_URL}{API_PATH_PREFIX}/oauth/device/code"
 DEVICE_TOKEN_ENDPOINT = f"{config.SEEDR_API_BASE_URL}{API_PATH_PREFIX}/oauth/device/token"
 TOKEN_ENDPOINT = f"{config.SEEDR_API_BASE_URL}{API_PATH_PREFIX}/oauth/token"
 
-# Campos donde se espera encontrar el token de refresco / expiración.
-# AJUSTAR si la respuesta real de la API usa otros nombres.
 FIELD_ACCESS_TOKEN = "access_token"
 FIELD_REFRESH_TOKEN = "refresh_token"
 FIELD_EXPIRES_IN = "expires_in"
@@ -59,61 +46,11 @@ class SeedrAuthError(Exception):
         self.error_code = error_code
 
 
-class TokenStore:
-    """Persiste y refresca el token de acceso de Seedr en disco (JSON)."""
+class SeedrAuthPending(Exception):
+    """Señal interna: el usuario todavía no aprobó el device code."""
 
-    def __init__(self, path: Path = config.SEEDR_TOKEN_FILE):
-        self.path = Path(path)
-        self._data: Dict[str, Any] = {}
-        self._load()
 
-    def _load(self) -> None:
-        if self.path.exists():
-            try:
-                self._data = json.loads(self.path.read_text())
-            except (json.JSONDecodeError, OSError):
-                logger.warning("No se pudo leer el archivo de token %s, se recreará.", self.path)
-                self._data = {}
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2))
-
-    def save_token_response(self, token_data: Dict[str, Any]) -> None:
-        access_token = token_data.get(FIELD_ACCESS_TOKEN)
-        if not access_token:
-            raise SeedrAuthError(f"La respuesta de token no contiene '{FIELD_ACCESS_TOKEN}': {token_data}")
-
-        refresh_token = token_data.get(FIELD_REFRESH_TOKEN, self._data.get(FIELD_REFRESH_TOKEN))
-        expires_in = token_data.get(FIELD_EXPIRES_IN, 3600)
-
-        self._data = {
-            FIELD_ACCESS_TOKEN: access_token,
-            FIELD_REFRESH_TOKEN: refresh_token,
-            "obtained_at": time.time(),
-            "expires_at": time.time() + int(expires_in) - 60,  # 60s de margen
-        }
-        self._save()
-
-    @property
-    def access_token(self) -> Optional[str]:
-        return self._data.get(FIELD_ACCESS_TOKEN)
-
-    @property
-    def refresh_token(self) -> Optional[str]:
-        return self._data.get(FIELD_REFRESH_TOKEN)
-
-    @property
-    def is_expired(self) -> bool:
-        expires_at = self._data.get("expires_at")
-        if not expires_at:
-            return True
-        return time.time() >= expires_at
-
-    @property
-    def has_token(self) -> bool:
-        return bool(self.access_token)
-
+# --------------------------------------------------------- HTTP (síncrono)
 
 def request_device_code(scope: str = "files.read files.write profile account.read tasks.write tasks.read archives.manage") -> Dict[str, Any]:
     """Paso 1: solicita device_code + user_code."""
@@ -139,52 +76,48 @@ def request_device_code(scope: str = "files.read files.write profile account.rea
         raise SeedrAuthError(message, error_code=error_code) from e
 
 
-def poll_for_token(device_code: str, interval: int, expires_in: int) -> Optional[Dict[str, Any]]:
-    """Paso 3: hace polling al endpoint de token hasta que el usuario autoriza."""
+def poll_device_token_once(device_code: str) -> Optional[Dict[str, Any]]:
+    """Un solo intento de polling. Devuelve el token si ya fue aprobado,
+    lanza SeedrAuthPending si sigue pendiente, o SeedrAuthError si hubo un
+    error terminal (denegado, expirado, etc.)."""
     payload = {
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         "device_code": device_code,
         "client_id": config.SEEDR_CLIENT_ID,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    resp = requests.post(DEVICE_TOKEN_ENDPOINT, data=payload, headers=headers, timeout=30)
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        raise SeedrAuthError(f"Respuesta no-JSON del polling: {resp.text[:200]}")
 
-    expiry_time = time.time() + expires_in
+    if resp.ok:
+        return data
+
+    error = data.get("error")
+    error_description = data.get("error_description", error)
+    if error in ("authorization_pending", "slow_down"):
+        raise SeedrAuthPending()
+    raise SeedrAuthError(error_description or f"Autorización fallida: {error}", error_code=error)
+
+
+def poll_for_token_blocking(device_code: str, interval: int, expires_in: int) -> Optional[Dict[str, Any]]:
+    """Hace polling de forma bloqueante (para usar en un hilo aparte vía
+    asyncio.to_thread, o desde el script CLI authenticate.py)."""
+    deadline = time.time() + expires_in
     current_interval = interval
-
-    print(f"Esperando autorización... (cada {current_interval}s, expira en {expires_in}s)")
-
-    while time.time() < expiry_time:
+    while time.time() < deadline:
         time.sleep(current_interval)
-        if time.time() >= expiry_time:
-            print("\nEl tiempo de espera expiró.")
-            return None
         try:
-            resp = requests.post(DEVICE_TOKEN_ENDPOINT, data=payload, headers=headers, timeout=30)
-            data = resp.json()
-            if resp.ok:
-                print("\n¡Autenticación exitosa!")
-                return data
-            error = data.get("error")
-            error_description = data.get("error_description", error)
-            if error == "authorization_pending":
-                sys.stdout.write(".")
-                sys.stdout.flush()
-            elif error == "slow_down":
-                current_interval = min(int(current_interval * 1.5), 60)
-                print(f"[slow down - nuevo intervalo: {current_interval}s]")
-            elif error in ("expired_token", "access_denied"):
-                raise SeedrAuthError(error_description or f"Autorización fallida: {error}", error_code=error)
-            else:
-                raise SeedrAuthError(f"Error de polling: {error_description}", error_code=error)
-        except requests.exceptions.Timeout:
-            print("\nTimeout en el polling. Reintentando...")
+            token_data = poll_device_token_once(device_code)
+            if token_data:
+                return token_data
+        except SeedrAuthPending:
+            continue
         except requests.exceptions.RequestException as e:
-            print(f"\nError de red en polling: {e}. Reintentando...")
+            logger.warning("Error de red en polling de Seedr: %s. Reintentando...", e)
             time.sleep(max(current_interval, 5))
-        except json.JSONDecodeError:
-            print("\nError decodificando respuesta de polling. Reintentando...")
-
-    print("\nEl device flow terminó sin obtener token.")
     return None
 
 
@@ -215,24 +148,48 @@ def refresh_access_token(refresh_token: str) -> Dict[str, Any]:
         raise SeedrAuthError(message, error_code=error_code) from e
 
 
-def get_valid_access_token(store: TokenStore) -> str:
+# ------------------------------------------------------------ persistencia
+
+def save_token_response(token_data: Dict[str, Any], updated_by: Optional[int] = None) -> None:
+    access_token = token_data.get(FIELD_ACCESS_TOKEN)
+    if not access_token:
+        raise SeedrAuthError(f"La respuesta de token no contiene '{FIELD_ACCESS_TOKEN}': {token_data}")
+
+    existing = db.get_seedr_token()
+    refresh_token = token_data.get(FIELD_REFRESH_TOKEN) or (existing.get("refresh_token") if existing else None)
+    expires_in = token_data.get(FIELD_EXPIRES_IN, 3600)
+    expires_at = time.time() + int(expires_in) - 60  # 60s de margen
+
+    db.save_seedr_token(access_token, refresh_token, expires_at, updated_by)
+
+
+def has_saved_token() -> bool:
+    return db.get_seedr_token() is not None
+
+
+def get_valid_access_token() -> str:
     """Devuelve un access_token válido, refrescándolo si hace falta.
 
-    Lanza SeedrAuthError si no hay token guardado (hay que correr authenticate.py primero)
-    o si el refresco falla (puede requerir re-autenticación manual).
-    """
-    if not store.has_token:
+    Lanza SeedrAuthError si no hay token guardado (hay que vincular la cuenta
+    con /auth en Telegram, o `python authenticate.py`) o si el refresco falla
+    (puede requerir re-vincular la cuenta)."""
+    row = db.get_seedr_token()
+    if not row:
         raise SeedrAuthError(
-            "No hay token de Seedr guardado. Ejecuta `python authenticate.py` primero "
-            "para vincular la cuenta."
+            "No hay ninguna cuenta de Seedr vinculada. Un administrador debe "
+            "enviarle /auth al bot en Telegram para vincularla."
         )
-    if store.is_expired:
-        if not store.refresh_token:
-            raise SeedrAuthError(
-                "El token de Seedr expiró y no hay refresh_token disponible. "
-                "Ejecuta `python authenticate.py` para re-autenticar."
-            )
-        logger.info("Access token de Seedr expirado, refrescando...")
-        new_token_data = refresh_access_token(store.refresh_token)
-        store.save_token_response(new_token_data)
-    return store.access_token
+
+    if time.time() < row["expires_at"]:
+        return row["access_token"]
+
+    if not row.get("refresh_token"):
+        raise SeedrAuthError(
+            "El token de Seedr expiró y no hay refresh_token disponible. "
+            "Volvé a vincular la cuenta con /auth."
+        )
+
+    logger.info("Access token de Seedr expirado, refrescando...")
+    new_token_data = refresh_access_token(row["refresh_token"])
+    save_token_response(new_token_data)
+    return db.get_seedr_token()["access_token"]

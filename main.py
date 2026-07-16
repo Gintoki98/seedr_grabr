@@ -6,22 +6,27 @@ Arranca:
   - El monitor de RSS (revisa el feed periódicamente y encola matches).
   - N workers que procesan la cola (Seedr -> disco local -> Telegram -> limpieza).
 
+No depende de ningún archivo local ni volumen persistente: todo el estado
+(filtros, cola, y el token OAuth de Seedr) vive en PostgreSQL. La cuenta de
+Seedr se vincula desde el propio bot con el comando /auth — no hace falta
+correr nada por consola ni subir secretos a GitHub.
+
 Uso:
-    python authenticate.py   # una sola vez, para vincular la cuenta de Seedr
     python main.py
+    # luego, en Telegram: enviarle /auth al bot para vincular Seedr
 """
 import asyncio
 import logging
 import signal
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 import config
 import db
 import rss_watcher
 import telegram_bot
 import worker
-from seedr_auth import TokenStore
 
 logging.basicConfig(
     level=config.LOG_LEVEL,
@@ -42,28 +47,36 @@ def _validate_config() -> None:
         missing.append("TELEGRAM_TARGET_CHAT")
     if not config.SEEDR_CLIENT_ID:
         missing.append("SEEDR_CLIENT_ID")
+    if not config.DATABASE_URL:
+        missing.append("DATABASE_URL")
     if missing:
         raise SystemExit(
             "Faltan variables de entorno requeridas: " + ", ".join(missing) + "\n"
-            "Copia .env.example a .env y completa los valores."
+            "Revisá .env.example / las variables de entorno configuradas en Coolify."
+        )
+    if not config.TELEGRAM_ADMIN_IDS:
+        logger.warning(
+            "TELEGRAM_ADMIN_IDS está vacío: cualquier persona que le escriba al bot podrá "
+            "usar /auth y vincular tu cuenta de Seedr. Se recomienda fuertemente configurarlo."
         )
 
 
 async def main():
     _validate_config()
     db.init_db()
+    logger.info("Base de datos (PostgreSQL) lista.")
 
-    token_store = TokenStore()
-    if not token_store.has_token:
-        raise SystemExit(
-            "No hay token de Seedr guardado. Ejecuta `python authenticate.py` primero."
-        )
-
-    telegram_client = TelegramClient("bot_session", config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
+    # Sesión de Telegram en memoria: no se persiste a disco, así el bot no
+    # depende de ningún volumen. Al reiniciar simplemente vuelve a loguearse
+    # con el bot_token (normal y sin restricciones para cuentas de bot).
+    telegram_client = TelegramClient(StringSession(), config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
     telegram_bot.register_handlers(telegram_client)
 
     await telegram_client.start(bot_token=config.TELEGRAM_BOT_TOKEN)
     logger.info("Bot de Telegram conectado.")
+
+    if not config.TELEGRAM_ADMIN_IDS:
+        logger.warning("Recordatorio: configurá TELEGRAM_ADMIN_IDS para restringir /auth y /addfilter.")
 
     upload_queue: asyncio.Queue = asyncio.Queue()
     stop_event = asyncio.Event()
@@ -88,7 +101,7 @@ async def main():
     for i in range(max(1, config.QUEUE_CONCURRENCY)):
         tasks.append(
             asyncio.create_task(
-                worker.worker_loop(f"worker-{i}", upload_queue, token_store, telegram_client, stop_event),
+                worker.worker_loop(f"worker-{i}", upload_queue, telegram_client, stop_event),
                 name=f"worker-{i}",
             )
         )

@@ -1,0 +1,29 @@
+# Pensado para desplegar en Coolify como recurso "Docker Compose".
+#
+# La base de datos PostgreSQL NO se define acá: se crea como un recurso
+# aparte en Coolify (Coolify -> New Resource -> Database -> PostgreSQL),
+# y su connection string se pega como variable de entorno DATABASE_URL
+# de este servicio. Así la base persiste independientemente del ciclo de
+# vida de la app, y Coolify se encarga de su volumen/backup.
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_TARGET_CHAT=${TELEGRAM_TARGET_CHAT}
+      - TELEGRAM_ADMIN_IDS=${TELEGRAM_ADMIN_IDS}
+      - SEEDR_API_BASE_URL=${SEEDR_API_BASE_URL:-https://api.seedr.cc}
+      - SEEDR_CLIENT_ID=${SEEDR_CLIENT_ID}
+      - SEEDR_CLIENT_SECRET=${SEEDR_CLIENT_SECRET:-}
+      - SEEDR_SPACE_SAFETY_MARGIN_BYTES=${SEEDR_SPACE_SAFETY_MARGIN_BYTES:-209715200}
+      - SEEDR_TASK_TIMEOUT_SECONDS=${SEEDR_TASK_TIMEOUT_SECONDS:-10800}
+      - SEEDR_POLL_INTERVAL_SECONDS=${SEEDR_POLL_INTERVAL_SECONDS:-20}
+      - SEEDR_DEVICE_FLOW_MAX_WAIT_SECONDS=${SEEDR_DEVICE_FLOW_MAX_WAIT_SECONDS:-900}
+      - RSS_FEED_URL=${RSS_FEED_URL:-https://nyaa.si/?page=rss}
+      - RSS_POLL_INTERVAL_SECONDS=${RSS_POLL_INTERVAL_SECONDS:-300}
+      - QUEUE_CONCURRENCY=${QUEUE_CONCURRENCY:-1}
+      - DATABASE_URL=${DATABASE_URL}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
