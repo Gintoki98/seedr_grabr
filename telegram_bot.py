@@ -225,11 +225,14 @@ def register_handlers(client: TelegramClient) -> None:
             f"{header}\n\n**Cola actual:**\n" + "\n".join(lines) + extra, parse_mode="markdown"
         )
 
-    @client.on(events.NewMessage(pattern=r"^/seedrls$"))
+    @client.on(events.NewMessage(pattern=r"^/seedrls(?:\s+(\d+))?$"))
     async def seedrls_handler(event):
         if not _is_admin(event.sender_id):
             await event.respond("No tienes permiso para usar este comando.")
             return
+
+        raw_folder_id = event.pattern_match.group(1)
+        folder_id = int(raw_folder_id) if raw_folder_id else 0
 
         try:
             seedr_client = await asyncio.to_thread(worker.get_seedr_client)
@@ -238,45 +241,57 @@ def register_handlers(client: TelegramClient) -> None:
             return
 
         try:
-            root = await asyncio.to_thread(seedr_client.get_folder_contents, 0)
-            tasks_raw = await asyncio.to_thread(seedr_client.list_tasks)
+            contents = await asyncio.to_thread(seedr_client.get_folder_contents, folder_id)
         except SeedrApiError as e:
-            await event.respond(f"❌ Error consultando Seedr: {e}")
+            await event.respond(f"❌ Error consultando la carpeta `{folder_id}`: {e}", parse_mode="markdown")
             return
 
-        folders = root.get("folders", []) if isinstance(root, dict) else []
-        files = root.get("files", []) if isinstance(root, dict) else []
-        tasks = tasks_raw if isinstance(tasks_raw, list) else tasks_raw.get("tasks", [])
+        folders = contents.get("folders", []) if isinstance(contents, dict) else []
+        files = contents.get("files", []) if isinstance(contents, dict) else []
 
-        lines = ["📦 **Contenido actual en Seedr**\n"]
+        location = "raíz" if folder_id == 0 else f"carpeta `{folder_id}`"
+        lines = [f"📦 **Contenido de {location}**\n"]
 
-        if tasks:
-            lines.append("**Tareas activas (torrents descargando):**")
-            for t in tasks[:20]:
-                tid = t.get("id") or t.get("task_id")
-                name = t.get("name") or t.get("filename") or "(sin nombre)"
-                status = t.get("status", "?")
-                progress = t.get("progress", "?")
-                lines.append(f"  task `{tid}` — {name} [{status} {progress}]")
-            lines.append("")
+        if folder_id != 0:
+            lines.append("⬅️ Raíz: `/seedrls`\n")
 
         if folders:
-            lines.append("**Carpetas en raíz:**")
-            for fo in folders[:20]:
-                lines.append(f"  folder `{fo.get('id')}` — {fo.get('name')}")
+            lines.append("**Subcarpetas (usa el id con /seedrls <id> para entrar):**")
+            for fo in folders[:30]:
+                fid = fo.get("id") or fo.get("folder_id")
+                fname = fo.get("name") or fo.get("folder_name") or fo.get("title") or "(sin nombre)"
+                lines.append(f"  📁 `{fid}` — {fname}")
             lines.append("")
 
         if files:
-            lines.append("**Archivos en raíz (usa el id con /seedrpush):**")
+            lines.append("**Archivos (usa el id con /seedrpush):**")
             for fi in files[:30]:
                 fid = fi.get("id") or fi.get("file_id")
-                lines.append(f"  file `{fid}` — {fi.get('name')} ({fi.get('size', '?')} bytes)")
+                fname = fi.get("name") or fi.get("file_name") or "(sin nombre)"
+                fsize = fi.get("size", "?")
+                lines.append(f"  📄 `{fid}` — {fname} ({fsize} bytes)")
+            lines.append("")
 
-        if not (tasks or folders or files):
-            lines.append("No hay nada en Seedr ahora mismo.")
+        if not (folders or files):
+            if folder_id == 0:
+                # Puede que en la raíz solo haya tareas activas, no carpetas/archivos todavía.
+                try:
+                    tasks_raw = await asyncio.to_thread(seedr_client.list_tasks)
+                    tasks = tasks_raw if isinstance(tasks_raw, list) else tasks_raw.get("tasks", [])
+                except SeedrApiError:
+                    tasks = []
+                if tasks:
+                    lines.append("**Tareas activas (torrents descargando):**")
+                    for t in tasks[:20]:
+                        tid = t.get("id") or t.get("task_id")
+                        name = t.get("name") or t.get("filename") or "(sin nombre)"
+                        lines.append(f"  ⏳ task `{tid}` — {name} [{t.get('status', '?')} {t.get('progress', '?')}]")
+                else:
+                    lines.append("No hay nada acá.")
+            else:
+                lines.append("Esta carpeta está vacía.")
 
         text = "\n".join(lines)
-        # Telegram limita ~4096 caracteres por mensaje.
         await event.respond(text[:4000], parse_mode="markdown")
 
     @client.on(events.NewMessage(pattern=r"^/seedrpush(?:\s+(.*))?$"))

@@ -20,9 +20,26 @@ BASE_DIR = Path(__file__).resolve().parent
 TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
 # Canal/grupo destino donde se subirán los archivos ya descargados.
 # Puede ser un username (@canal), un id numérico (-100...) o un invite link.
-TELEGRAM_TARGET_CHAT = os.environ.get("TELEGRAM_TARGET_CHAT", "")
+def _normalize_chat_id(value: str):
+    """Telethon, al ser bot, interpreta un string compuesto solo de dígitos
+    como número de teléfono y falla ('Cannot get entity by phone number as
+    a bot'). Si el valor es puramente numérico (con o sin '-' inicial, como
+    los IDs de canal -100...), lo convertimos a int para que lo trate como
+    ID de chat y no como teléfono. Si es un @username o invite link, se
+    deja como string tal cual."""
+    if not value:
+        return value
+    v = value.strip()
+    if v.lstrip("-").isdigit():
+        return int(v)
+    return value
+
+
+TELEGRAM_TARGET_CHAT = _normalize_chat_id(os.environ.get("TELEGRAM_TARGET_CHAT", ""))
+
 # IDs de usuario de Telegram autorizados a administrar filtros/bot y a vincular
 # la cuenta de Seedr (/auth), separados por coma. MUY recomendado definir esto:
 # /auth expone credenciales de tu cuenta de Seedr, no debe quedar abierto a cualquiera.
