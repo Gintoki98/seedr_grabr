@@ -150,11 +150,15 @@ async def _process_item(
         await asyncio.to_thread(db.update_item_status, item_id, "downloading_local")
 
         for f in files:
-            file_id = f.get("id") or f.get("file_id")
-            file_name = _sanitize_filename(f.get("name", f"file_{file_id}"))
+            logger.info("Procesando entrada de archivo cruda: %s", f)
+            file_id = f.get("id") or f.get("file_id") or f.get("folder_file_id")
+            if file_id is None:
+                raise SeedrApiError(f"No se pudo determinar el id de archivo en la entrada: {f}")
+
+            file_name = _sanitize_filename(f.get("name") or f.get("file_name") or f"file_{file_id}")
             dest = config.DOWNLOAD_DIR / f"{item_id}_{file_name}"
 
-            logger.info("Descargando %s a %s", file_name, dest)
+            logger.info("Descargando %s (file_id=%s) a %s", file_name, file_id, dest)
             await asyncio.to_thread(client.download_file_to_path, file_id, dest)
 
             # 6) Borrar el archivo de Seedr ni bien está en local, para liberar espacio.

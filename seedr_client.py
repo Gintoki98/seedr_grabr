@@ -269,15 +269,27 @@ class SeedrClient:
         raise SeedrApiError(f"No se encontró URL de descarga en la respuesta: {resp}")
 
     def download_file_to_path(self, file_id: int, destination: Path, chunk_size: int = 1024 * 1024) -> Path:
-        """Descarga un archivo directamente vía GET /download/file/{id}
-        (endpoint documentado como 'Direct file download. Returns the file
-        content.'), usando la sesión ya autenticada."""
+        """Descarga un archivo resolviendo primero la URL firmada temporal
+        (GET /download/file/{id}/url) y bajando esa URL directamente, sin
+        pasarle el Authorization header de Seedr (las URLs firmadas suelen
+        llevar su propia autenticación en query params)."""
         destination.parent.mkdir(parents=True, exist_ok=True)
-        response = self.request(f"/download/file/{file_id}", raw=True, stream=True)
-        with open(destination, "wb") as f:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
+        download_url = self.get_file_download_url(file_id)
+        logger.info("URL de descarga resuelta para file_id=%s: %s", file_id, download_url)
+
+        with requests.get(download_url, stream=True, timeout=120) as response:
+            logger.info("Descarga file_id=%s -> status=%s content-length=%s",
+                        file_id, response.status_code, response.headers.get("Content-Length"))
+            response.raise_for_status()
+            with open(destination, "wb") as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+
+        size_on_disk = destination.stat().st_size
+        logger.info("Descarga completa: %s (%d bytes)", destination, size_on_disk)
+        if size_on_disk == 0:
+            raise SeedrApiError(f"El archivo descargado {destination} quedó en 0 bytes.")
         return destination
 
     # ------------------------------------------------------- funcionalidad de alto nivel
@@ -349,7 +361,15 @@ class SeedrClient:
                 f"La tarea {task_id} no terminó de descargar dentro de Seedr en {timeout_seconds}s."
             )
 
-        files = self.get_task_contents(task_id)
-        if isinstance(files, dict):
-            files = files.get("files", [])
-        return files or []
+        raw = self.get_task_contents(task_id)
+        logger.info("Contenido crudo de la tarea %s (/tasks/%s/contents): %s", task_id, task_id, raw)
+
+        if isinstance(raw, dict):
+            files = raw.get("files") or raw.get("contents") or raw.get("items") or []
+        elif isinstance(raw, list):
+            files = raw
+        else:
+            files = []
+
+        logger.info("Archivos detectados para la tarea %s: %s", task_id, files)
+        return files
